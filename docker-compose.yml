@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  nats:
+    image: nats:latest
+    container_name: finplatform-nats
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    command: ["--jetstream", "-m", "8222", "--store_dir", "/data"]
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+
+  # PostgreSQL is already running on localhost:5432
+  # Database: fineract_default
+  # User: fineract / Password: fineract
+
+volumes:
+  nats-data:
+
+networks:
+  default:
+    name: finplatform-network
