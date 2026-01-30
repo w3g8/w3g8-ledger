@@ -1,22 +1,36 @@
-// Package cards provides card payment processing via w3g8 acquiring.
+// Package cards provides card payment processing via w3g8-card-payments acquiring.
 package cards
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/oklog/ulid/v2"
 
-	"finplatform/internal/domain"
-	"finplatform/internal/events"
+	"finplatform/internal/common/money"
+	"finplatform/internal/funding"
+)
+
+// NATS subjects for acquiring service.
+const (
+	SubjectAuthorize = "acquiring.authorize"
+	SubjectCapture   = "acquiring.capture"
+	SubjectVoid      = "acquiring.void"
+	SubjectRefund    = "acquiring.refund"
+
+	// Event subjects from acquiring.
+	SubjectTxnApproved   = "acquiring.events.txn.approved"
+	SubjectTxnDeclined   = "acquiring.events.txn.declined"
+	SubjectTxnCaptured   = "acquiring.events.txn.captured"
+	SubjectTxnRefunded   = "acquiring.events.txn.refunded"
+	SubjectTxnVoided     = "acquiring.events.txn.voided"
+	SubjectTxnChargeback = "acquiring.events.txn.chargeback"
 )
 
 // CardBrand represents the card brand.
@@ -46,22 +60,25 @@ const (
 	StatusCaptured   Status = "CAPTURED"
 	StatusFailed     Status = "FAILED"
 	StatusRefunded   Status = "REFUNDED"
+	StatusVoided     Status = "VOIDED"
+	StatusChargeback Status = "CHARGEBACK"
 )
 
 // Config holds card adapter configuration.
 type Config struct {
-	BaseURL     string        `env:"CARDS_BASE_URL"`
-	MerchantID  string        `env:"CARDS_MERCHANT_ID"`
-	APIKey      string        `env:"CARDS_API_KEY"`
-	Timeout     time.Duration `env:"CARDS_TIMEOUT" envDefault:"30s"`
-	AutoCapture bool          `env:"CARDS_AUTO_CAPTURE" envDefault:"true"`
+	NATSUrl        string        `env:"NATS_URL"`
+	MerchantID     string        `env:"CARDS_MERCHANT_ID"`
+	RequestTimeout time.Duration `env:"CARDS_TIMEOUT" envDefault:"30s"`
+	AutoCapture    bool          `env:"CARDS_AUTO_CAPTURE" envDefault:"true"`
 }
 
 // Payment represents a card payment.
 type Payment struct {
 	ID             string
-	TenantID       domain.TenantID
-	CustomerID     domain.CustomerID
+	TenantID       string
+	WalletID       string
+	CustomerID     string
+	IntentID       string // Links to FundingIntent
 	CardToken      string
 	TransactionID  string
 	AuthCode       string
@@ -69,14 +86,15 @@ type Payment struct {
 	CardBrand      CardBrand
 	CardType       CardType
 	AmountMinor    int64
-	Currency       domain.Currency
+	Currency       string
 	ThreeDSVersion string
 	ThreeDSStatus  string
 	Status         Status
-	DepositID      *domain.DepositID
 	InitiatedAt    time.Time
 	AuthorisedAt   *time.Time
 	CapturedAt     *time.Time
+	RefundedAt     *time.Time
+	ChargebackAt   *time.Time
 	ErrorCode      string
 	ErrorMessage   string
 	DeclineReason  string
@@ -85,154 +103,227 @@ type Payment struct {
 	UpdatedAt      time.Time
 }
 
-// ChargeRequest is the request to charge a card.
-type ChargeRequest struct {
-	TenantID    domain.TenantID
-	CustomerID  domain.CustomerID
-	CardToken   string // Tokenized card from vault
-	AmountMinor int64
-	Currency    domain.Currency
-	Reference   string
-	ThreeDS     *ThreeDSData
+// AuthorizeRequest is sent to acquiring service.
+type AuthorizeRequest struct {
+	TransactionID string         `json:"transactionId"`
+	MerchantID    string         `json:"merchantId"`
+	Amount        int64          `json:"amount"`
+	Currency      string         `json:"currency"`
+	CardToken     string         `json:"cardToken"`
+	ThreeDS       *ThreeDSData   `json:"threeDs,omitempty"`
+	EntryMode     string         `json:"entryMode"`
+	Capture       bool           `json:"capture"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+}
+
+// AuthorizeResponse from acquiring service.
+type AuthorizeResponse struct {
+	Success         bool   `json:"success"`
+	TransactionID   string `json:"transactionId"`
+	Approved        bool   `json:"approved"`
+	AuthCode        string `json:"authCode"`
+	ResponseCode    string `json:"responseCode"`
+	ResponseMessage string `json:"responseMessage"`
+	CardBrand       string `json:"cardBrand,omitempty"`
+	CardLastFour    string `json:"cardLast4,omitempty"`
+	Error           string `json:"error,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
+
+// CaptureRequest is sent to acquiring for capture.
+type CaptureRequest struct {
+	TransactionID string `json:"transactionId"`
+	Amount        int64  `json:"amount,omitempty"`
+}
+
+// RefundRequest is sent to acquiring for refund.
+type RefundRequest struct {
+	TransactionID string `json:"transactionId"`
+	Amount        int64  `json:"amount"`
+	Reason        string `json:"reason,omitempty"`
 }
 
 // ThreeDSData contains 3D Secure authentication data.
 type ThreeDSData struct {
-	Version      string
-	Cavv         string
-	Eci          string
-	TransactionID string
+	Version       string `json:"version"`
+	Cavv          string `json:"cavv"`
+	Eci           string `json:"eci"`
+	TransactionID string `json:"dsTransactionId,omitempty"`
+	Status        string `json:"status"`
 }
 
-// ChargeResponse is the response from a charge attempt.
-type ChargeResponse struct {
-	TransactionID  string    `json:"transaction_id"`
-	AuthCode       string    `json:"auth_code"`
-	Status         string    `json:"status"` // AUTHORISED, CAPTURED, FAILED
-	CardLastFour   string    `json:"card_last_four"`
-	CardBrand      string    `json:"card_brand"`
-	CardType       string    `json:"card_type"`
-	ErrorCode      string    `json:"error_code,omitempty"`
-	ErrorMessage   string    `json:"error_message,omitempty"`
-	DeclineReason  string    `json:"decline_reason,omitempty"`
+// ChargebackEvent from acquiring service.
+type ChargebackEvent struct {
+	TransactionID   string    `json:"transactionId"`
+	ChargebackID    string    `json:"chargebackId"`
+	Amount          int64     `json:"amount"`
+	Reason          string    `json:"reason"`
+	ReasonCode      string    `json:"reasonCode"`
+	Timestamp       time.Time `json:"timestamp"`
+	NetworkRef      string    `json:"networkRef,omitempty"`
+	AcquirerRef     string    `json:"acquirerRef,omitempty"`
+	ResponseDueDate time.Time `json:"responseDueDate,omitempty"`
+}
+
+// FundingService callback interface.
+type FundingService interface {
+	ProcessCardPayment(ctx context.Context, intentID, transactionID string, captured bool) error
+	ProcessChargeback(ctx context.Context, intentID, reason string) error
 }
 
 // Adapter implements the card payment provider.
 type Adapter struct {
-	config     Config
-	httpClient *http.Client
-	store      *Store
-	publisher  EventPublisher
-	logger     *slog.Logger
-}
-
-// EventPublisher publishes events.
-type EventPublisher interface {
-	Publish(ctx context.Context, subject string, env *events.Envelope) error
+	config         Config
+	nc             *nats.Conn
+	store          *Store
+	fundingService FundingService
+	logger         *slog.Logger
+	subs           []*nats.Subscription
 }
 
 // NewAdapter creates a new card adapter.
-func NewAdapter(cfg Config, store *Store, publisher EventPublisher, logger *slog.Logger) *Adapter {
-	return &Adapter{
-		config: cfg,
-		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-		},
-		store:     store,
-		publisher: publisher,
-		logger:    logger,
+func NewAdapter(cfg Config, nc *nats.Conn, store *Store, fundingSvc FundingService, logger *slog.Logger) (*Adapter, error) {
+	a := &Adapter{
+		config:         cfg,
+		nc:             nc,
+		store:          store,
+		fundingService: fundingSvc,
+		logger:         logger,
+	}
+
+	// Subscribe to acquiring events
+	if err := a.subscribeToEvents(); err != nil {
+		return nil, fmt.Errorf("subscribe to events: %w", err)
+	}
+
+	return a, nil
+}
+
+// subscribeToEvents subscribes to acquiring event subjects.
+func (a *Adapter) subscribeToEvents() error {
+	subjects := map[string]nats.MsgHandler{
+		SubjectTxnCaptured:   a.handleCaptured,
+		SubjectTxnRefunded:   a.handleRefunded,
+		SubjectTxnChargeback: a.handleChargeback,
+	}
+
+	for subject, handler := range subjects {
+		sub, err := a.nc.Subscribe(subject, handler)
+		if err != nil {
+			return fmt.Errorf("subscribe %s: %w", subject, err)
+		}
+		a.subs = append(a.subs, sub)
+		a.logger.Info("subscribed to acquiring events", "subject", subject)
+	}
+
+	return nil
+}
+
+// Close cleans up subscriptions.
+func (a *Adapter) Close() {
+	for _, sub := range a.subs {
+		sub.Unsubscribe()
 	}
 }
 
-// Charge processes a card payment.
-func (a *Adapter) Charge(ctx context.Context, req *ChargeRequest) (*ChargeResponse, error) {
+// Charge implements CardProvider.Charge - authorizes and optionally captures a card payment.
+func (a *Adapter) Charge(ctx context.Context, intent *funding.FundingIntent, cardToken string, threeDS *funding.ThreeDSData) (providerRef string, err error) {
+	txnID := fmt.Sprintf("TXN-%s", ulid.Make().String())
+
 	a.logger.Info("charging card",
-		"customer_id", req.CustomerID,
-		"amount", req.AmountMinor,
-		"card_token", maskToken(req.CardToken),
+		"intent_id", intent.ID,
+		"transaction_id", txnID,
+		"amount", intent.Amount.AmountMinor,
+		"card_token", maskToken(cardToken),
 	)
 
-	// Build API request
-	apiReq := map[string]any{
-		"merchant_id": a.config.MerchantID,
-		"card_token":  req.CardToken,
-		"amount":      float64(req.AmountMinor) / 100,
-		"currency":    req.Currency,
-		"reference":   req.Reference,
-		"capture":     a.config.AutoCapture,
+	// Build authorize request
+	req := AuthorizeRequest{
+		TransactionID: txnID,
+		MerchantID:    a.config.MerchantID,
+		Amount:        intent.Amount.AmountMinor,
+		Currency:      string(intent.Amount.Currency),
+		CardToken:     cardToken,
+		EntryMode:     "ECOMMERCE",
+		Capture:       a.config.AutoCapture,
+		Metadata: map[string]any{
+			"intent_id":   intent.ID,
+			"wallet_id":   intent.WalletID,
+			"customer_id": intent.CustomerID,
+		},
 	}
 
-	if req.ThreeDS != nil {
-		apiReq["three_ds"] = map[string]any{
-			"version":        req.ThreeDS.Version,
-			"cavv":           req.ThreeDS.Cavv,
-			"eci":            req.ThreeDS.Eci,
-			"transaction_id": req.ThreeDS.TransactionID,
+	if threeDS != nil {
+		req.ThreeDS = &ThreeDSData{
+			Version:       threeDS.Version,
+			Cavv:          threeDS.Cavv,
+			Eci:           threeDS.Eci,
+			TransactionID: threeDS.TransactionID,
+			Status:        "Y", // Authenticated
 		}
 	}
 
-	body, _ := json.Marshal(apiReq)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.config.BaseURL+"/charge", bytes.NewReader(body))
+	reqData, _ := json.Marshal(req)
+
+	// Send to acquiring via NATS request-reply
+	msg, err := a.nc.RequestWithContext(ctx, SubjectAuthorize, reqData)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return "", fmt.Errorf("nats request: %w", err)
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.config.APIKey)
-
-	httpResp, err := a.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	respBody, _ := io.ReadAll(httpResp.Body)
-
-	var resp ChargeResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
+	var resp AuthorizeResponse
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return "", fmt.Errorf("unmarshal response: %w", err)
 	}
 
-	// Store payment record
+	// Create local payment record
 	payment := &Payment{
 		ID:            ulid.Make().String(),
-		TenantID:      req.TenantID,
-		CustomerID:    req.CustomerID,
-		CardToken:     req.CardToken,
-		TransactionID: resp.TransactionID,
-		AuthCode:      resp.AuthCode,
-		CardLastFour:  resp.CardLastFour,
-		CardBrand:     CardBrand(resp.CardBrand),
-		CardType:      CardType(resp.CardType),
-		AmountMinor:   req.AmountMinor,
-		Currency:      req.Currency,
+		TenantID:      intent.TenantID,
+		WalletID:      intent.WalletID,
+		CustomerID:    intent.CustomerID,
+		IntentID:      intent.ID,
+		CardToken:     cardToken,
+		TransactionID: txnID,
+		AmountMinor:   intent.Amount.AmountMinor,
+		Currency:      string(intent.Amount.Currency),
+		Status:        StatusPending,
 		InitiatedAt:   time.Now(),
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
 
-	if req.ThreeDS != nil {
-		payment.ThreeDSVersion = req.ThreeDS.Version
+	if threeDS != nil {
+		payment.ThreeDSVersion = threeDS.Version
 		payment.ThreeDSStatus = "AUTHENTICATED"
 	}
 
-	switch resp.Status {
-	case "AUTHORISED":
-		payment.Status = StatusAuthorised
-		now := time.Now()
-		payment.AuthorisedAt = &now
-	case "CAPTURED":
-		payment.Status = StatusCaptured
-		now := time.Now()
-		payment.AuthorisedAt = &now
-		payment.CapturedAt = &now
-		// Publish deposit event for captured payments
-		a.publishDepositDetected(ctx, payment)
-	case "FAILED":
+	if !resp.Success || !resp.Approved {
 		payment.Status = StatusFailed
-		payment.ErrorCode = resp.ErrorCode
-		payment.ErrorMessage = resp.ErrorMessage
-		payment.DeclineReason = resp.DeclineReason
+		payment.ErrorCode = resp.ResponseCode
+		payment.ErrorMessage = resp.ResponseMessage
+		if resp.Error != "" {
+			payment.ErrorCode = resp.Error
+			payment.ErrorMessage = resp.Message
+		}
+		if err := a.store.Create(ctx, payment); err != nil {
+			a.logger.Error("failed to store failed payment", "error", err)
+		}
+		return "", fmt.Errorf("authorization declined: %s - %s", resp.ResponseCode, resp.ResponseMessage)
+	}
+
+	// Authorization approved
+	payment.AuthCode = resp.AuthCode
+	payment.CardBrand = CardBrand(resp.CardBrand)
+	payment.CardLastFour = resp.CardLastFour
+	now := time.Now()
+	payment.AuthorisedAt = &now
+
+	if a.config.AutoCapture {
+		payment.Status = StatusCaptured
+		payment.CapturedAt = &now
+	} else {
+		payment.Status = StatusAuthorised
 	}
 
 	if err := a.store.Create(ctx, payment); err != nil {
@@ -240,108 +331,205 @@ func (a *Adapter) Charge(ctx context.Context, req *ChargeRequest) (*ChargeRespon
 	}
 
 	a.logger.Info("card charge completed",
-		"transaction_id", resp.TransactionID,
-		"status", resp.Status,
+		"intent_id", intent.ID,
+		"transaction_id", txnID,
+		"auth_code", resp.AuthCode,
+		"status", payment.Status,
 	)
 
-	return &resp, nil
+	return txnID, nil
 }
 
-// Capture captures a previously authorized payment.
-func (a *Adapter) Capture(ctx context.Context, transactionID string) error {
-	payment, err := a.store.GetByTransactionID(ctx, transactionID)
+// Capture implements CardProvider.Capture - captures a previously authorized payment.
+func (a *Adapter) Capture(ctx context.Context, providerRef string) error {
+	payment, err := a.store.GetByTransactionID(ctx, providerRef)
 	if err != nil {
-		return err
+		return fmt.Errorf("get payment: %w", err)
 	}
 
 	if payment.Status != StatusAuthorised {
 		return fmt.Errorf("payment not in AUTHORISED status: %s", payment.Status)
 	}
 
-	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-		a.config.BaseURL+"/capture/"+transactionID, nil)
-	httpReq.Header.Set("Authorization", "Bearer "+a.config.APIKey)
+	a.logger.Info("capturing payment", "transaction_id", providerRef)
 
-	httpResp, err := a.httpClient.Do(httpReq)
+	req := CaptureRequest{
+		TransactionID: providerRef,
+		Amount:        payment.AmountMinor,
+	}
+	reqData, _ := json.Marshal(req)
+
+	msg, err := a.nc.RequestWithContext(ctx, SubjectCapture, reqData)
 	if err != nil {
-		return fmt.Errorf("capture request: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode >= 400 {
-		return fmt.Errorf("capture failed: status=%d", httpResp.StatusCode)
+		return fmt.Errorf("nats capture request: %w", err)
 	}
 
-	// Update status
-	a.store.MarkCaptured(ctx, transactionID)
+	var resp struct {
+		Success       bool   `json:"success"`
+		TransactionID string `json:"transactionId"`
+		Status        string `json:"status"`
+		Error         string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return fmt.Errorf("unmarshal capture response: %w", err)
+	}
 
-	// Publish deposit event
-	payment.Status = StatusCaptured
-	now := time.Now()
-	payment.CapturedAt = &now
-	a.publishDepositDetected(ctx, payment)
+	if !resp.Success {
+		return fmt.Errorf("capture failed: %s", resp.Error)
+	}
+
+	// Update local status
+	if err := a.store.MarkCaptured(ctx, providerRef); err != nil {
+		a.logger.Error("failed to update capture status", "error", err)
+	}
+
+	a.logger.Info("payment captured", "transaction_id", providerRef)
 
 	return nil
 }
 
-// Refund refunds a captured payment.
-func (a *Adapter) Refund(ctx context.Context, transactionID string, amountMinor int64) error {
-	payment, err := a.store.GetByTransactionID(ctx, transactionID)
+// Refund implements CardProvider.Refund - refunds a captured payment.
+func (a *Adapter) Refund(ctx context.Context, providerRef string, amount money.Money) error {
+	payment, err := a.store.GetByTransactionID(ctx, providerRef)
 	if err != nil {
-		return err
+		return fmt.Errorf("get payment: %w", err)
 	}
 
 	if payment.Status != StatusCaptured {
 		return fmt.Errorf("payment not in CAPTURED status: %s", payment.Status)
 	}
 
-	apiReq := map[string]any{
-		"amount": float64(amountMinor) / 100,
+	a.logger.Info("refunding payment",
+		"transaction_id", providerRef,
+		"amount", amount.AmountMinor,
+	)
+
+	req := RefundRequest{
+		TransactionID: providerRef,
+		Amount:        amount.AmountMinor,
+		Reason:        "Customer requested refund",
 	}
-	body, _ := json.Marshal(apiReq)
+	reqData, _ := json.Marshal(req)
 
-	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-		a.config.BaseURL+"/refund/"+transactionID, bytes.NewReader(body))
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.config.APIKey)
-
-	httpResp, err := a.httpClient.Do(httpReq)
+	msg, err := a.nc.RequestWithContext(ctx, SubjectRefund, reqData)
 	if err != nil {
-		return fmt.Errorf("refund request: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode >= 400 {
-		return fmt.Errorf("refund failed: status=%d", httpResp.StatusCode)
+		return fmt.Errorf("nats refund request: %w", err)
 	}
 
-	// Update status (could be partial refund, but simplified here)
-	a.store.MarkRefunded(ctx, transactionID)
+	var resp struct {
+		Success             bool   `json:"success"`
+		TransactionID       string `json:"transactionId"`
+		RefundTransactionID string `json:"refundTransactionId"`
+		Status              string `json:"status"`
+		Error               string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return fmt.Errorf("unmarshal refund response: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("refund failed: %s", resp.Error)
+	}
+
+	// Update local status
+	if err := a.store.MarkRefunded(ctx, providerRef); err != nil {
+		a.logger.Error("failed to update refund status", "error", err)
+	}
+
+	a.logger.Info("payment refunded",
+		"transaction_id", providerRef,
+		"refund_txn_id", resp.RefundTransactionID,
+	)
 
 	return nil
 }
 
-func (a *Adapter) publishDepositDetected(ctx context.Context, payment *Payment) {
-	if a.publisher == nil {
+// handleCaptured processes txn.captured events from acquiring.
+func (a *Adapter) handleCaptured(msg *nats.Msg) {
+	var event struct {
+		TransactionID string    `json:"transactionId"`
+		Amount        int64     `json:"amount"`
+		Timestamp     time.Time `json:"timestamp"`
+	}
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
+		a.logger.Error("unmarshal captured event", "error", err)
 		return
 	}
 
-	depositID := domain.DepositID(ulid.Make().String())
+	a.logger.Info("received capture event", "transaction_id", event.TransactionID)
 
-	// Link deposit to card payment
-	a.store.LinkDeposit(ctx, payment.TransactionID, depositID)
-
-	event := events.DepositInboundDetected{
-		DepositID:   depositID,
-		Rail:        domain.Rail("CARD_" + string(payment.CardBrand)),
-		AmountMinor: payment.AmountMinor,
-		Currency:    payment.Currency,
-		ExternalRef: payment.TransactionID,
-		ReceivedAt:  time.Now(),
+	ctx := context.Background()
+	payment, err := a.store.GetByTransactionID(ctx, event.TransactionID)
+	if err != nil {
+		a.logger.Error("payment not found for capture event", "transaction_id", event.TransactionID)
+		return
 	}
 
-	env, _ := events.NewEnvelope("deposit.inbound.detected.v1", payment.TenantID, payment.TransactionID, &event)
-	a.publisher.Publish(ctx, events.SubjectDepositInboundDetected, env)
+	// Update local status
+	a.store.MarkCaptured(ctx, event.TransactionID)
+
+	// Notify funding service
+	if a.fundingService != nil && payment.IntentID != "" {
+		if err := a.fundingService.ProcessCardPayment(ctx, payment.IntentID, event.TransactionID, true); err != nil {
+			a.logger.Error("failed to process card payment in funding service", "error", err)
+		}
+	}
+}
+
+// handleRefunded processes txn.refunded events from acquiring.
+func (a *Adapter) handleRefunded(msg *nats.Msg) {
+	var event struct {
+		TransactionID       string    `json:"transactionId"`
+		RefundTransactionID string    `json:"refundTransactionId"`
+		Amount              int64     `json:"amount"`
+		Timestamp           time.Time `json:"timestamp"`
+	}
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
+		a.logger.Error("unmarshal refunded event", "error", err)
+		return
+	}
+
+	a.logger.Info("received refund event",
+		"transaction_id", event.TransactionID,
+		"refund_txn_id", event.RefundTransactionID,
+	)
+
+	ctx := context.Background()
+	a.store.MarkRefunded(ctx, event.TransactionID)
+}
+
+// handleChargeback processes chargeback events from acquiring.
+func (a *Adapter) handleChargeback(msg *nats.Msg) {
+	var event ChargebackEvent
+	if err := json.Unmarshal(msg.Data, &event); err != nil {
+		a.logger.Error("unmarshal chargeback event", "error", err)
+		return
+	}
+
+	a.logger.Warn("received chargeback",
+		"transaction_id", event.TransactionID,
+		"chargeback_id", event.ChargebackID,
+		"reason", event.Reason,
+		"amount", event.Amount,
+	)
+
+	ctx := context.Background()
+	payment, err := a.store.GetByTransactionID(ctx, event.TransactionID)
+	if err != nil {
+		a.logger.Error("payment not found for chargeback", "transaction_id", event.TransactionID)
+		return
+	}
+
+	// Update local status
+	a.store.MarkChargeback(ctx, event.TransactionID, event.Reason)
+
+	// Notify funding service to reverse the ledger entry
+	if a.fundingService != nil && payment.IntentID != "" {
+		reason := fmt.Sprintf("Chargeback: %s (%s)", event.Reason, event.ReasonCode)
+		if err := a.fundingService.ProcessChargeback(ctx, payment.IntentID, reason); err != nil {
+			a.logger.Error("failed to process chargeback in funding service", "error", err)
+		}
+	}
 }
 
 func maskToken(token string) string {
@@ -365,25 +553,26 @@ func NewStore(pool *pgxpool.Pool) *Store {
 func (s *Store) Create(ctx context.Context, payment *Payment) error {
 	query := `
 		INSERT INTO card_payments (
-			id, tenant_id, customer_id, card_token, transaction_id, auth_code,
+			id, tenant_id, wallet_id, customer_id, intent_id, card_token, transaction_id, auth_code,
 			card_last_four, card_brand, card_type, amount_minor, currency,
-			three_ds_version, three_ds_status, card_status, deposit_id,
-			initiated_at, authorised_at, captured_at,
+			three_ds_version, three_ds_status, card_status,
+			initiated_at, authorised_at, captured_at, refunded_at, chargeback_at,
 			error_code, error_message, decline_reason, response_data,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 	`
 
 	responseData, _ := json.Marshal(payment.ResponseData)
 
 	_, err := s.pool.Exec(ctx, query,
-		payment.ID, payment.TenantID, payment.CustomerID,
-		payment.CardToken, payment.TransactionID, nullableString(payment.AuthCode),
-		nullableString(payment.CardLastFour), payment.CardBrand, payment.CardType,
-		payment.AmountMinor, payment.Currency,
+		payment.ID, payment.TenantID, payment.WalletID, payment.CustomerID,
+		nullableString(payment.IntentID), payment.CardToken, payment.TransactionID,
+		nullableString(payment.AuthCode), nullableString(payment.CardLastFour),
+		payment.CardBrand, payment.CardType, payment.AmountMinor, payment.Currency,
 		nullableString(payment.ThreeDSVersion), nullableString(payment.ThreeDSStatus),
-		payment.Status, payment.DepositID,
+		payment.Status,
 		payment.InitiatedAt, payment.AuthorisedAt, payment.CapturedAt,
+		payment.RefundedAt, payment.ChargebackAt,
 		nullableString(payment.ErrorCode), nullableString(payment.ErrorMessage),
 		nullableString(payment.DeclineReason), responseData,
 		payment.CreatedAt, payment.UpdatedAt,
@@ -394,10 +583,10 @@ func (s *Store) Create(ctx context.Context, payment *Payment) error {
 // GetByTransactionID retrieves a payment by transaction ID.
 func (s *Store) GetByTransactionID(ctx context.Context, txnID string) (*Payment, error) {
 	query := `
-		SELECT id, tenant_id, customer_id, card_token, transaction_id, auth_code,
+		SELECT id, tenant_id, wallet_id, customer_id, intent_id, card_token, transaction_id, auth_code,
 			   card_last_four, card_brand, card_type, amount_minor, currency,
-			   three_ds_version, three_ds_status, card_status, deposit_id,
-			   initiated_at, authorised_at, captured_at,
+			   three_ds_version, three_ds_status, card_status,
+			   initiated_at, authorised_at, captured_at, refunded_at, chargeback_at,
 			   error_code, error_message, decline_reason, response_data,
 			   created_at, updated_at
 		FROM card_payments WHERE transaction_id = $1
@@ -406,18 +595,16 @@ func (s *Store) GetByTransactionID(ctx context.Context, txnID string) (*Payment,
 	row := s.pool.QueryRow(ctx, query, txnID)
 
 	var p Payment
-	var authCode, lastFour, threeDSVer, threeDSStatus *string
+	var intentID, authCode, lastFour, threeDSVer, threeDSStatus *string
 	var errorCode, errorMsg, declineReason *string
-	var depositID *string
 	var responseData []byte
 
 	err := row.Scan(
-		&p.ID, &p.TenantID, &p.CustomerID,
-		&p.CardToken, &p.TransactionID, &authCode,
-		&lastFour, &p.CardBrand, &p.CardType,
-		&p.AmountMinor, &p.Currency,
-		&threeDSVer, &threeDSStatus, &p.Status, &depositID,
-		&p.InitiatedAt, &p.AuthorisedAt, &p.CapturedAt,
+		&p.ID, &p.TenantID, &p.WalletID, &p.CustomerID,
+		&intentID, &p.CardToken, &p.TransactionID, &authCode,
+		&lastFour, &p.CardBrand, &p.CardType, &p.AmountMinor, &p.Currency,
+		&threeDSVer, &threeDSStatus, &p.Status,
+		&p.InitiatedAt, &p.AuthorisedAt, &p.CapturedAt, &p.RefundedAt, &p.ChargebackAt,
 		&errorCode, &errorMsg, &declineReason, &responseData,
 		&p.CreatedAt, &p.UpdatedAt,
 	)
@@ -428,6 +615,9 @@ func (s *Store) GetByTransactionID(ctx context.Context, txnID string) (*Payment,
 		return nil, err
 	}
 
+	if intentID != nil {
+		p.IntentID = *intentID
+	}
 	if authCode != nil {
 		p.AuthCode = *authCode
 	}
@@ -449,9 +639,68 @@ func (s *Store) GetByTransactionID(ctx context.Context, txnID string) (*Payment,
 	if declineReason != nil {
 		p.DeclineReason = *declineReason
 	}
-	if depositID != nil {
-		d := domain.DepositID(*depositID)
-		p.DepositID = &d
+
+	return &p, nil
+}
+
+// GetByIntentID retrieves a payment by funding intent ID.
+func (s *Store) GetByIntentID(ctx context.Context, intentID string) (*Payment, error) {
+	query := `
+		SELECT id, tenant_id, wallet_id, customer_id, intent_id, card_token, transaction_id, auth_code,
+			   card_last_four, card_brand, card_type, amount_minor, currency,
+			   three_ds_version, three_ds_status, card_status,
+			   initiated_at, authorised_at, captured_at, refunded_at, chargeback_at,
+			   error_code, error_message, decline_reason, response_data,
+			   created_at, updated_at
+		FROM card_payments WHERE intent_id = $1
+	`
+
+	row := s.pool.QueryRow(ctx, query, intentID)
+
+	var p Payment
+	var iID, authCode, lastFour, threeDSVer, threeDSStatus *string
+	var errorCode, errorMsg, declineReason *string
+	var responseData []byte
+
+	err := row.Scan(
+		&p.ID, &p.TenantID, &p.WalletID, &p.CustomerID,
+		&iID, &p.CardToken, &p.TransactionID, &authCode,
+		&lastFour, &p.CardBrand, &p.CardType, &p.AmountMinor, &p.Currency,
+		&threeDSVer, &threeDSStatus, &p.Status,
+		&p.InitiatedAt, &p.AuthorisedAt, &p.CapturedAt, &p.RefundedAt, &p.ChargebackAt,
+		&errorCode, &errorMsg, &declineReason, &responseData,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("payment not found for intent: %s", intentID)
+		}
+		return nil, err
+	}
+
+	if iID != nil {
+		p.IntentID = *iID
+	}
+	if authCode != nil {
+		p.AuthCode = *authCode
+	}
+	if lastFour != nil {
+		p.CardLastFour = *lastFour
+	}
+	if threeDSVer != nil {
+		p.ThreeDSVersion = *threeDSVer
+	}
+	if threeDSStatus != nil {
+		p.ThreeDSStatus = *threeDSStatus
+	}
+	if errorCode != nil {
+		p.ErrorCode = *errorCode
+	}
+	if errorMsg != nil {
+		p.ErrorMessage = *errorMsg
+	}
+	if declineReason != nil {
+		p.DeclineReason = *declineReason
 	}
 
 	return &p, nil
@@ -459,22 +708,29 @@ func (s *Store) GetByTransactionID(ctx context.Context, txnID string) (*Payment,
 
 // MarkCaptured marks payment as captured.
 func (s *Store) MarkCaptured(ctx context.Context, txnID string) error {
-	query := `UPDATE card_payments SET card_status = $2, captured_at = $3 WHERE transaction_id = $1`
+	query := `UPDATE card_payments SET card_status = $2, captured_at = $3, updated_at = $3 WHERE transaction_id = $1`
 	_, err := s.pool.Exec(ctx, query, txnID, StatusCaptured, time.Now())
 	return err
 }
 
 // MarkRefunded marks payment as refunded.
 func (s *Store) MarkRefunded(ctx context.Context, txnID string) error {
-	query := `UPDATE card_payments SET card_status = $2 WHERE transaction_id = $1`
-	_, err := s.pool.Exec(ctx, query, txnID, StatusRefunded)
+	query := `UPDATE card_payments SET card_status = $2, refunded_at = $3, updated_at = $3 WHERE transaction_id = $1`
+	_, err := s.pool.Exec(ctx, query, txnID, StatusRefunded, time.Now())
 	return err
 }
 
-// LinkDeposit links a deposit to the card payment.
-func (s *Store) LinkDeposit(ctx context.Context, txnID string, depositID domain.DepositID) error {
-	query := `UPDATE card_payments SET deposit_id = $2 WHERE transaction_id = $1`
-	_, err := s.pool.Exec(ctx, query, txnID, depositID)
+// MarkVoided marks payment as voided.
+func (s *Store) MarkVoided(ctx context.Context, txnID string) error {
+	query := `UPDATE card_payments SET card_status = $2, updated_at = $3 WHERE transaction_id = $1`
+	_, err := s.pool.Exec(ctx, query, txnID, StatusVoided, time.Now())
+	return err
+}
+
+// MarkChargeback marks payment as chargebacked.
+func (s *Store) MarkChargeback(ctx context.Context, txnID, reason string) error {
+	query := `UPDATE card_payments SET card_status = $2, chargeback_at = $3, decline_reason = $4, updated_at = $3 WHERE transaction_id = $1`
+	_, err := s.pool.Exec(ctx, query, txnID, StatusChargeback, time.Now(), reason)
 	return err
 }
 
